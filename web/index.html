@@ -483,11 +483,11 @@ async function handleInput(text){
   if(lo==='/model'){addLine(`  ${currentModel==='9b'?'Qwen3.5-9B (32K ctx)':'Qwen3.5-35B-A3B (8K ctx)'}`,'line-white line-bold');addLine('');return;}
   if(lo==='/quit'){addLine(`\n  mac code  ${sessionTurns} turns · ${sessionTokens} tokens`,'line-yellow');addLine('\n  Goodbye!','line-dim');input.disabled=true;return;}
 
-  // ── Route: agent (tools) or direct LLM ──
+  // ── Route through agent (like agent.py) ──
   slashMenu.classList.remove('visible');
 
-  // If it needs tools and backend is available, use PicoClaw agent
-  if(useBackend && needsTools(text)){
+  // When backend is available, ALWAYS use PicoClaw agent (like agent.py)
+  if(useBackend){
     const iv=showLoading();
     const t0=performance.now();
     try{
@@ -500,13 +500,12 @@ async function handleInput(text){
       addLine('');
       const tokens=resp.split(/\s+/).length;
       const speed=(tokens/parseFloat(elapsed)).toFixed(1);
-      addHTML(`  <span style="color:#00dddd">▸ agent</span> <span style="color:#227722">${elapsed}s via PicoClaw</span>`);
+      addHTML(`  <span style="color:#33ff33">${speed} tok/s</span>  <span style="color:#227722">·  ${tokens} tokens  ·  ${elapsed}s</span>`);
       sessionTurns++;sessionTokens+=tokens;
     }catch(e){
       hideLoading(iv);
       addLine(`\n  agent error: ${e.message}`,'line-error');
       addLine('  falling back to direct LLM...','line-dim');
-      // Fall through to streaming below
       chatHistory.push({role:'user',content:text});
       await streamDirect();
     }
@@ -514,7 +513,7 @@ async function handleInput(text){
     return;
   }
 
-  // Direct LLM streaming
+  // Fallback: direct LLM streaming (no backend)
   chatHistory.push({role:'user',content:text});
 
   async function streamDirect(){
@@ -601,13 +600,12 @@ async function boot(){
   addLine('  Model: Qwen3.5-9B (5.28 GB) ✓','line-dim');
   await new Promise(r=>setTimeout(r,200));
 
-  // Detect backend
+  // Detect backend (quick health check, not a full agent call)
   try{
-    const res=await fetch(BACKEND_URL+'/api/agent',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:'ping',session:'boot'}),signal:AbortSignal.timeout(3000)});
+    const res=await fetch(BACKEND_URL+'/',{method:'GET',signal:AbortSignal.timeout(2000)});
     if(res.ok){useBackend=true;addLine('  Agent: PicoClaw ✓ (web search enabled)','line-dim');}
-    else{addLine('  Agent: not available (no web search)','line-dim');}
-  }catch(e){addLine('  Agent: not available (no web search)','line-dim');}
+    else{addLine('  Agent: direct LLM only (run server.py for search)','line-dim');}
+  }catch(e){addLine('  Agent: direct LLM only (run server.py for search)','line-dim');}
   await new Promise(r=>setTimeout(r,200));
 
   addLine('  Server: localhost:8000 ✓','line-dim');
