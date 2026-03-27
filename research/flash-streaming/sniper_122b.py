@@ -389,16 +389,15 @@ class SniperEngine:
         v = x @ v_w.t()  # [kv_heads * head_dim]
 
         # Simplified single-token attention with GQA expansion
-        # V has kv_heads groups, Q has num_heads. Expand V to match Q dims.
-        # For single token: softmax(Q@K^T/sqrt(d)) = 1, so attn_out = V expanded
+        # V has kv_heads groups, O expects num_heads*head_dim input
+        # Use O projection's input dim to determine correct expansion
         kv_dim = v.shape[0]
-        q_dim = q.shape[0]
-        if kv_dim < q_dim:
-            # GQA: repeat V to match Q head count
-            repeat_factor = q_dim // kv_dim
-            attn_out = v.repeat(repeat_factor)
+        o_in_dim = o_w.shape[1]  # O: [hidden, num_heads*head_dim]
+        if kv_dim < o_in_dim:
+            repeat_factor = o_in_dim // kv_dim
+            attn_out = v.repeat(repeat_factor)[:o_in_dim]
         else:
-            attn_out = v
+            attn_out = v[:o_in_dim]
 
         out = attn_out @ o_w.t()
 
