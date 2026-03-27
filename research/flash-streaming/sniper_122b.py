@@ -387,16 +387,33 @@ class SniperEngine:
         norm_w = self.pinned[f"{prefix}.post_attention_layernorm.weight"]
         normed = self._rms_norm(h, norm_w)
 
-        # Route
-        expert_ids, expert_weights = self.route(normed, layer_idx)
+        # Check if this layer has a router (MoE) or is dense
+        has_router = False
+        for p in prefix_candidates:
+            if f"{p}.mlp.gate.weight" in self.pinned:
+                has_router = True
+                break
 
-        # Run active experts (loaded from NVMe)
-        expert_out = self.run_expert_ffn(normed, layer_idx, expert_ids, expert_weights)
-
-        # Run shared expert (pinned in VRAM)
-        shared_out = self.run_shared_expert(normed, layer_idx)
-
-        return h + expert_out + shared_out
+        if has_router:
+            # MoE layer: route → load experts → compute → discard
+            expert_ids, expert_weights = self.route(normed, layer_idx)
+            expert_out = self.run_expert_ffn(normed, layer_idx, expert_ids, expert_weights)
+            shared_out = self.run_shared_expert(normed, layer_idx)
+            return h + expert_out + shared_out
+        else:
+            # Dense layer: standard SwiGLU FFN (pinned in VRAM)
+            gate_w = self._dequant_pinned(f"{prefix}.mlp.gate_proj")
+            up_w = self._dequant_pinned(f"{prefix}.mlp.up_proj")
+            down_w = self._dequant_pinned(f"{prefix}.mlp.down_proj")
+            if gate_w is not None:
+                x_flat = normed.squeeze(0).squeeze(0)
+                gate_out = F.silu(x_flat @ gate_w.t())
+                up_out = x_flat @ up_w.t()
+                hidden = gate_out * up_out
+                ffn_out = hidden @ down_w.t()
+                del gate_w, up_w, down_w
+                return h + ffn_out.unsqueeze(0).unsqueeze(0)
+            return h
 
     def forward_token(self, token_id):
         """Full forward pass for one token through all layers."""

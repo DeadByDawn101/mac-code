@@ -72,15 +72,19 @@ def main():
     pinned_keys = []
     expert_keys = {}  # layer_idx -> expert_idx -> [keys]
 
-    # The weight names follow the pattern:
-    # language_model.model.layers.{i}.mlp.switch_mlp.experts.{j}.{gate_proj|up_proj|down_proj}.{weight|scales|biases}
-    # OR for the text-only model:
-    # model.layers.{i}.mlp.switch_mlp.experts.{j}.{gate_proj|up_proj|down_proj}.{weight|scales|biases}
+    # Weight names in MLX-community models (language_model. prefix stripped):
+    #   model.layers.{i}.mlp.experts.{j}.{gate_proj|up_proj|down_proj}.{weight|scales|biases}
+    # The 35B used .mlp.switch_mlp.experts. but 122B uses .mlp.experts. directly.
+    # We check for both patterns.
 
     for key in sorted(key_to_shard.keys()):
         is_expert = False
         for prefix in ["language_model.model.layers.", "model.layers."]:
-            if prefix in key and ".mlp.switch_mlp.experts." in key:
+            # Match both .mlp.experts. and .mlp.switch_mlp.experts.
+            if prefix in key and ".mlp." in key and ".experts." in key:
+                # Skip shared_expert keys — those get pinned
+                if ".shared_expert." in key:
+                    break
                 # Parse layer and expert index
                 after_prefix = key.split(prefix)[1]
                 parts = after_prefix.split(".")
