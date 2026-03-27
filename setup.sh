@@ -10,7 +10,7 @@ echo ""
 # 1. Dependencies
 echo "  [1/5] Installing dependencies..."
 brew install llama.cpp 2>/dev/null || echo "  llama.cpp already installed"
-pip3 install huggingface-hub rich --break-system-packages -q 2>/dev/null
+pip3 install huggingface-hub rich ddgs --break-system-packages -q 2>/dev/null
 
 # 2. Download model
 echo "  [2/5] Downloading Qwen3.5-35B-A3B (10.6 GB)..."
@@ -50,7 +50,7 @@ echo ""
 echo "    llama-server \\"
 echo "      --model ~/models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \\"
 echo "      --port 8000 --host 127.0.0.1 \\"
-echo "      --flash-attn on --ctx-size 65536 \\"
+echo "      --flash-attn on --ctx-size 12288 \\"
 echo "      --cache-type-k q4_0 --cache-type-v q4_0 \\"
 echo "      --n-gpu-layers 99 --reasoning off -np 1 -t 4"
 echo ""

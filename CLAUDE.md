@@ -27,7 +27,7 @@ brew install llama.cpp
 pip3 install huggingface-hub rich --break-system-packages
 ```
 
-### 3. Download the 35B MoE model (default — 30 tok/s via SSD paging)
+### 3. Download the 35B MoE model (default — 30 tok/s, fits in 16 GB RAM)
 
 ```bash
 mkdir -p ~/models
@@ -65,7 +65,7 @@ cp config.example.json ~/.picoclaw/config.json
 
 ### 7. Start the LLM server
 
-For the 35B MoE model (default — 30 tok/s, SSD paging):
+For the 35B MoE model (default — 30 tok/s, fits in RAM as IQ2_M):
 ```bash
 llama-server \
     --model ~/models/Qwen3.5-35B-A3B-UD-IQ2_M.gguf \
@@ -102,7 +102,7 @@ python3 agent.py
 ## Architecture
 
 Two models, one agent:
-- **35B MoE (IQ2_M)** — Default. 30 tok/s via SSD paging, 12K context. The breakthrough: a 35B model on a $600 Mac mini.
+- **35B MoE (IQ2_M, 10.6 GB)** — Default. 30 tok/s, fits entirely in 16 GB RAM. 12K context. A 35B model on a $600 Mac mini.
 - **9B (Q4_K_M)** — 64K context with quantized KV cache. Persistent context via MLX (save/load in 0.0003s, R2 sync).
 
 Both use text-based intent routing (not JSON tool calling). Switch with `/model 9b` or `/model 35b`.
