@@ -286,17 +286,21 @@ def main():
                 mapped = remap_key(raw_key)
                 tensor = f.get_tensor(raw_key)
 
-                # Try direct match, then as buffer
                 if mapped in model_param_names or mapped in model_buffer_names:
                     try:
-                        dtype = torch.bfloat16 if tensor.is_floating_point() else tensor.dtype
-                        set_module_tensor_to_device(model, mapped, device=device, value=tensor.to(dtype))
+                        # Keep original dtype for special tensors like A_log
+                        if tensor.is_floating_point():
+                            val = tensor.to(torch.bfloat16)
+                        else:
+                            val = tensor
+                        set_module_tensor_to_device(model, mapped, device=device, value=val)
                         loaded += 1
                     except Exception as e:
-                        print(f"    Skip raw {mapped}: {e}")
+                        print(f"    FAIL raw {mapped}: {e}")
                         skipped += 1
                 else:
-                    # Try without .weight suffix — handles dt_bias, A_log etc
+                    if "vision" not in mapped:
+                        print(f"    MISS raw {mapped}")
                     skipped += 1
 
             elif "weight" in parts and "scales" in parts:
