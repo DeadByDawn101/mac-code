@@ -177,7 +177,9 @@ class SniperEngine:
                 key = f"{proj}.{comp}"
                 full = handle.get_tensor(key)  # [256, out, in]
                 # Index only active experts: [top_k, out, in]
-                result[key] = full[ids].to(self.device)
+                # Use list indexing (not tensor) to avoid uint32 index error
+                slices = torch.stack([full[i] for i in ids])
+                result[key] = slices.to(self.device)
 
         return result
 
