@@ -172,7 +172,9 @@ def make_sniped_forward(moe_block, layer_idx, sniper, top_k):
             output = output + s_out
 
         del expert_w
-        return output.reshape(B, L, D)
+        # CRITICAL: HF expects (hidden_states, router_logits) tuple
+        # Without this, the parent layer silently corrupts the residual stream
+        return output.reshape(B, L, D), router_logits
 
     return forward
 
