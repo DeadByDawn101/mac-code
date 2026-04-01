@@ -27,7 +27,7 @@ export interface ServerHealth {
 
 export interface StreamCallbacks {
   onToken: (token: string) => void;
-  onDone: (stats: { tokensPerSec: number; totalTokens: number }) => void;
+  onDone: (stats: { tokPerSec: number; totalTokens: number }) => void;
   onError: (error: string) => void;
 }
 
@@ -42,15 +42,22 @@ export class LlamaClient {
     return this.get("/health");
   }
 
-  async chat(messages: Message[], maxTokens = 100): Promise<string> {
+  async chat(messages: Message[], maxTokens = 100): Promise<{ text: string; tokPerSec: number; totalTokens: number }> {
+    const start = Date.now();
     const resp = await this.post("/v1/chat/completions", {
       messages,
       temperature: 0,
       max_tokens: maxTokens,
       stream: false,
     });
+    const elapsed = (Date.now() - start) / 1000;
     const c = resp?.choices?.[0]?.message;
-    return c?.content || c?.reasoning_content || "";
+    const text = c?.content || c?.reasoning_content || "";
+    // Use server-reported usage if available, otherwise estimate from text
+    const completionTokens = resp?.usage?.completion_tokens || Math.ceil(text.length / 2.5);
+    const totalTokens = resp?.usage?.total_tokens || completionTokens;
+    const tokPerSec = elapsed > 0 ? Math.round((completionTokens / elapsed) * 10) / 10 : 0;
+    return { text, tokPerSec, totalTokens: completionTokens };
   }
 
   async getModelName(): Promise<string> {
@@ -116,7 +123,7 @@ export class LlamaClient {
                   const tokPerSec =
                     elapsed > 0 ? totalTokens / elapsed : 0;
                   callbacks.onDone({
-                    tokensPerSec: Math.round(tokPerSec * 10) / 10,
+                    tokPerSec: Math.round(tokPerSec * 10) / 10,
                     totalTokens,
                   });
                 }
@@ -136,7 +143,7 @@ export class LlamaClient {
                   const tokPerSec =
                     elapsed > 0 ? totalTokens / elapsed : 0;
                   callbacks.onDone({
-                    tokensPerSec: Math.round(tokPerSec * 10) / 10,
+                    tokPerSec: Math.round(tokPerSec * 10) / 10,
                     totalTokens,
                   });
                   resolve();
@@ -154,7 +161,7 @@ export class LlamaClient {
               const elapsed = (Date.now() - startTime) / 1000;
               const tokPerSec = elapsed > 0 ? totalTokens / elapsed : 0;
               callbacks.onDone({
-                tokensPerSec: Math.round(tokPerSec * 10) / 10,
+                tokPerSec: Math.round(tokPerSec * 10) / 10,
                 totalTokens,
               });
             }

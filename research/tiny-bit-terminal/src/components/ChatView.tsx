@@ -10,6 +10,84 @@ interface ChatEntry {
   content: string;
 }
 
+// ── PicoClaw-inspired: Tool Registry with TTL + Discovery ──
+interface ToolDef {
+  name: string;
+  description: string;
+  parameters: any;
+  hidden?: boolean;  // hidden tools are discoverable but not in every prompt
+  ttl?: number;      // remaining turns before auto-demotion back to hidden
+}
+
+// Core tools (always visible) — sorted alphabetically for deterministic KV cache
+const CORE_TOOLS: ToolDef[] = [
+  { name: "read_file", description: "Read a text file or parse a document (PDF/DOCX/image). Supports .txt, .md, .py, .js, .json, .csv, .png, .jpg, .pdf, .docx and more.", parameters: { type: "object", properties: { path: { type: "string", description: "File path to read or analyze" } }, required: ["path"] } },
+  { name: "search_tools", description: "Find additional tools by keyword. Use when you need a capability not listed above.", parameters: { type: "object", properties: { query: { type: "string", description: "What you need to do, e.g. 'write file' or 'list directory'" } }, required: ["query"] } },
+  { name: "shell", description: "Run a shell command on macOS and see the output", parameters: { type: "object", properties: { command: { type: "string", description: "The shell command to execute" } }, required: ["command"] } },
+  { name: "web_search", description: "Search the web for current information. Use specific technical terms, not natural language questions.", parameters: { type: "object", properties: { query: { type: "string", description: "Specific search query with precise keywords" } }, required: ["query"] } },
+];
+
+// Hidden tools (discoverable via search_tools) — promoted with TTL when found
+const HIDDEN_TOOLS: ToolDef[] = [
+  { name: "write_file", hidden: true, description: "Write content to a file, creating it if needed", parameters: { type: "object", properties: { path: { type: "string", description: "File path to write" }, content: { type: "string", description: "Content to write" } }, required: ["path", "content"] } },
+  { name: "list_dir", hidden: true, description: "List files and folders in a directory with details", parameters: { type: "object", properties: { path: { type: "string", description: "Directory path (default: home)" } }, required: [] } },
+  { name: "screenshot", hidden: true, description: "Capture a screenshot of the current screen", parameters: { type: "object", properties: {} } },
+  { name: "system_info", hidden: true, description: "Get system information: CPU, RAM, disk, OS version", parameters: { type: "object", properties: {} } },
+];
+
+const TOOL_PROMOTE_TTL = 5; // turns before auto-demotion
+
+// ── PicoClaw-inspired: Context Budget Management ──
+const CONTEXT_BUDGET = 1800; // tokens — leave headroom below llama-server's -c 2048
+const CHARS_PER_TOKEN = 2.5; // PicoClaw heuristic
+
+function estimateTokens(messages: Message[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    if (typeof m.content === "string") chars += m.content.length;
+    else chars += JSON.stringify(m.content).length;
+  }
+  return Math.ceil(chars / CHARS_PER_TOKEN);
+}
+
+function trimToContextBudget(messages: Message[], budget: number): Message[] {
+  if (estimateTokens(messages) <= budget) return messages;
+
+  // Always keep system prompt (index 0)
+  const system = messages[0];
+  let rest = messages.slice(1);
+
+  // Drop oldest messages in groups of 2 (user + assistant pairs)
+  // Never split tool-call sequences: user -> assistant(tool_call) -> user(tool_response)
+  while (estimateTokens([system, ...rest]) > budget && rest.length > 2) {
+    // Find safe cut point — don't split mid-tool-sequence
+    let cutIdx = 0;
+    for (let i = 0; i < rest.length - 1; i++) {
+      const content = typeof rest[i].content === "string" ? rest[i].content : "";
+      // Safe to cut before a user message that isn't a tool_response
+      if (rest[i].role === "user" && !content.includes("<tool_response>")) {
+        cutIdx = i;
+        break;
+      }
+      // Also safe to cut before a plain user message
+      if (i > 0 && rest[i].role === "user") {
+        cutIdx = i;
+        break;
+      }
+    }
+    // Remove from cutIdx, at least 2 messages
+    const removeCount = Math.max(2, cutIdx + 1);
+    rest = rest.slice(removeCount);
+  }
+
+  return [system, ...rest];
+}
+
+function buildToolsPrompt(coreTools: ToolDef[], promotedHidden: ToolDef[]): string {
+  const allVisible = [...coreTools, ...promotedHidden].sort((a, b) => a.name.localeCompare(b.name));
+  return JSON.stringify(allVisible.map(t => ({ name: t.name, description: t.description, parameters: t.parameters })), null, 2);
+}
+
 // Compare servers — check both ports for running models
 // Model registry for compare mode
 const MODEL_REGISTRY = [
@@ -67,32 +145,43 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState("");
   const [scrollOffset, setScrollOffset] = useState(0);
-  const messagesRef = useRef<Message[]>([
-    {
-      role: "system",
-      content:
-        `You are tiny bit, a helpful AI assistant running locally on Apple Silicon. Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. You respond concisely and helpfully.
+
+  // ── PicoClaw-inspired: Promoted hidden tools with TTL ──
+  const promotedToolsRef = useRef<ToolDef[]>([]);
+
+  // ── PicoClaw-inspired: Steering Queue — queue user input during tool execution ──
+  const steeringQueueRef = useRef<string[]>([]);
+  const isProcessingRef = useRef(false);
+
+  // Build system prompt with current tool set
+  const buildSystemPrompt = useCallback(() => {
+    const toolsJson = buildToolsPrompt(CORE_TOOLS, promotedToolsRef.current);
+    return `You are tiny bit, a helpful AI assistant running locally on Apple Silicon. Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. You respond concisely and helpfully.
 
 You have access to these tools. To use a tool, include a tool_call tag in your response:
 
 <tools>
-[
-  {"name": "shell", "description": "Run a shell command on macOS and see the output", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute"}}, "required": ["command"]}},
-  {"name": "web_search", "description": "Search the web using DuckDuckGo", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]}},
-  {"name": "read_file", "description": "Read a text file or analyze an image/PDF. Supports .txt, .md, .py, .js, .json, .csv, .png, .jpg, .pdf and more.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path to read or analyze"}}, "required": ["path"]}}
-]
+${toolsJson}
 </tools>
 
 To call a tool, output EXACTLY this format (no other text before it):
 <tool_call>{"name": "shell", "arguments": {"command": "ls ~/Desktop"}}</tool_call>
 
+You can call MULTIPLE tools at once by including multiple tool_call tags:
+<tool_call>{"name": "shell", "arguments": {"command": "ls ~/Desktop"}}</tool_call>
+<tool_call>{"name": "shell", "arguments": {"command": "date"}}</tool_call>
+
 After the tool runs, you will receive the result and can then respond to the user.
 Rules:
 - When the user asks about files, folders, or their system, USE the shell tool directly. Do not just suggest commands.
-- When the user asks about current events or news, USE the web_search tool.
-- You can call multiple tools in sequence.
-- After seeing tool results, give a clear summary to the user.`,
-    },
+- When the user asks about current events or news, USE the web_search tool. Use SPECIFIC keywords, not vague phrases. For example: instead of "today's news in the LLM world", search "LLM large language model news March 2026" or "OpenAI Anthropic Google AI announcements". Do multiple targeted searches if the topic is broad.
+- You can call multiple tools in sequence or in parallel.
+- After seeing tool results, give a clear summary to the user.
+- If you need a tool not listed above, use search_tools to find it.`;
+  }, []);
+
+  const messagesRef = useRef<Message[]>([
+    { role: "system", content: "" }, // placeholder — updated on first use
   ]);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -259,7 +348,7 @@ Rules:
                 await new Promise<void>((resolve) => {
                   cmpClient.streamChat(compareMessages, {
                     onToken: (token) => { results[server.name] += token; updateStreamDisplay(); },
-                    onDone: (s) => { cmpStats[server.name] = { tokPerSec: s.tokensPerSec, tokens: s.totalTokens }; updateStreamDisplay(); resolve(); },
+                    onDone: (s) => { cmpStats[server.name] = { tokPerSec: s.tokPerSec, tokens: s.totalTokens }; updateStreamDisplay(); resolve(); },
                     onError: (err) => { results[server.name] = `ERROR: ${err}`; updateStreamDisplay(); resolve(); },
                   });
                 });
@@ -338,11 +427,11 @@ Rules:
               // Ask LLM to generate command
               setSpinnerMsg("Generating command...");
               try {
-                const genResp = await client.chat([
+                const genResult = await client.chat([
                   { role: "system", content: "Generate a single macOS shell command for the user's request. Output ONLY the command, nothing else." },
                   { role: "user", content: args },
                 ]);
-                cmd = genResp.trim().replace(/^`+|`+$/g, "");
+                cmd = genResult.text.trim().replace(/^`+|`+$/g, "");
                 setSpinnerMsg(`Executing: $ ${cmd}`);
                 setEntries((prev) => [...prev, { role: "info", content: `◆ Running: $ ${cmd}` }]);
               } catch {
@@ -424,49 +513,83 @@ Rules:
               const isNews = /news|today|latest|recent|happened|breaking|update/i.test(args);
               const searchResults = execSync(
                 `/opt/homebrew/bin/python3.13 -c "
-import sys
+import sys, json
 from ddgs import DDGS
 from datetime import datetime
 query = sys.argv[1]
 is_news = sys.argv[2] == '1'
-results = []
+seen = set()
+out = []
+
+def add(title, body, date='', src='', url=''):
+    key = title.strip().lower()[:60]
+    if key in seen: return
+    seen.add(key)
+    line = ''
+    if date: line += '[' + date[:10] + '] '
+    line += title.strip()
+    if src: line += ' (' + src + ')'
+    line += ': ' + body.strip()
+    if url: line += ' | ' + url
+    out.append(line)
+
 with DDGS() as d:
     if is_news:
-        for r in d.news(query, max_results=8):
-            date = r.get('date', '')[:10]
-            src = r.get('source', '')
-            results.append('- [' + date + '] ' + r.get('title','') + ' (' + src + '): ' + r.get('body',''))
+        try:
+            for r in d.news(query, max_results=8):
+                add(r.get('title',''), r.get('body',''), r.get('date',''), r.get('source',''), r.get('url',''))
+        except: pass
+        try:
+            for r in d.text(query + ' ' + datetime.now().strftime('%Y-%m-%d'), max_results=5):
+                add(r.get('title',''), r.get('body',''), url=r.get('href',''))
+        except: pass
     else:
-        dated_query = query + ' ' + datetime.now().strftime('%B %Y')
-        for r in d.text(dated_query, max_results=8):
-            results.append('- ' + r.get('title','') + ': ' + r.get('body',''))
-print(chr(10).join(results))
+        try:
+            for r in d.text(query + ' ' + datetime.now().strftime('%B %Y'), max_results=8):
+                add(r.get('title',''), r.get('body',''), url=r.get('href',''))
+        except: pass
+        if len(out) < 4:
+            try:
+                for r in d.news(query, max_results=5):
+                    add(r.get('title',''), r.get('body',''), r.get('date',''), r.get('source',''))
+            except: pass
+
+for line in out[:10]:
+    print('- ' + line)
 " "${safeQuery}" "${isNews ? '1' : '0'}"`,
-                { encoding: "utf-8", timeout: 15000 }
+                { encoding: "utf-8", timeout: 20000 }
               ).trim();
               setSpinnerMsg("");
               if (searchResults) {
+                // Trim results to avoid context overflow — keep first 6 results, cap each at 200 chars
+                const trimmedResults = searchResults.split('\n').slice(0, 6).map(l => l.slice(0, 200)).join('\n');
                 setEntries((prev) => [
                   ...prev,
-                  { role: "info", content: `◆ Found ${searchResults.split('\n').length} results:\n${searchResults.split('\n').map(l => '  ' + l.slice(0, 120)).join('\n')}` },
+                  { role: "info", content: `◆ Found ${searchResults.split('\n').length} results:\n${trimmedResults.split('\n').map(l => '  ' + l.slice(0, 120)).join('\n')}` },
                 ]);
                 setSpinnerMsg("Synthesizing answer...");
-                // Send results to LLM for synthesis
+                // Send trimmed results to LLM — don't bloat conversation history
                 const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-                messagesRef.current.push({
-                  role: "user",
-                  content: `Today is ${today}. Summarize the key points from these search results. Be specific — include names, dates, and facts. Do not just list the sources.\n\nSearch results:\n${searchResults}\n\nUser's question: ${args}`,
-                });
+                // Use a temporary message array to avoid polluting conversation context
+                const searchMessages = [
+                  messagesRef.current[0], // system prompt
+                  {
+                    role: "user" as const,
+                    content: `Today is ${today}. Summarize these search results concisely. Include names, dates, facts.\n\nResults:\n${trimmedResults}\n\nQuestion: ${args}`,
+                  },
+                ];
                 // Stream LLM response (falls through to streaming below)
                 setIsStreaming(true);
                 setStreamingText("");
                 onStatusChange("streaming");
                 abortRef.current = new AbortController();
                 let fullText = "";
-                await client.streamChat(messagesRef.current, {
+                await client.streamChat(searchMessages, {
                   onToken: (token) => { setSpinnerMsg(""); fullText += token; setStreamingText(fullText); },
                   onDone: (stats) => {
                     setSpinnerMsg("");
+                    // Store only the summary in conversation history, not raw search data
+                    messagesRef.current.push({ role: "user", content: `[searched: ${args}]` });
                     messagesRef.current.push({ role: "assistant", content: fullText });
                     setEntries((prev) => [...prev, { role: "assistant", content: fullText }]);
                     setIsStreaming(false);
@@ -530,12 +653,27 @@ print(chr(10).join(results))
 
             let parsed = "";
             try {
-              const docExt = docPath.split(".").pop() || "pdf";
-              execSync(`cp "${docPath}" "/tmp/tinybit_doc.${docExt}"`, { timeout: 5000 });
-              parsed = execSync(`npx lit parse "/tmp/tinybit_doc.${docExt}" --dpi 72 --num-workers 1 -q 2>/dev/null | head -300`, {
-                encoding: "utf-8",
-                timeout: 30000,
-              }).trim();
+              const docExt = (docPath.split(".").pop() || "").toLowerCase();
+              if (docExt === "docx") {
+                parsed = execSync(
+                  `/opt/homebrew/bin/python3.13 -c "
+from docx import Document
+doc = Document('${docPath.replace(/'/g, "\\'")}')
+for p in doc.paragraphs:
+    if p.text.strip(): print(p.text)
+for t in doc.tables:
+    for row in t.rows:
+        print(' | '.join(c.text for c in row.cells))
+" 2>&1 | head -300`,
+                  { encoding: "utf-8", timeout: 15000 }
+                ).trim();
+              } else {
+                execSync(`cp "${docPath}" "/tmp/tinybit_doc.${docExt}"`, { timeout: 5000 });
+                parsed = execSync(`cd /Users/nicozahniser/mac-code-ui && npx lit parse "/tmp/tinybit_doc.${docExt}" --dpi 72 --num-workers 1 -q 2>/dev/null | head -300`, {
+                  encoding: "utf-8",
+                  timeout: 30000,
+                }).trim();
+              }
             } catch (err: any) {
               setSpinnerMsg("");
               setEntries((prev) => [...prev, { role: "error", content: `◆ Parse failed: ${err.message?.split("\n")[0]}` }]);
@@ -632,18 +770,42 @@ print(chr(10).join(results))
         messagesRef.current.push({ role: "user", content: trimmed });
       }
 
+      // ── PicoClaw-inspired: Steering Queue ──
+      // If we're already in the agent loop, queue this message for injection
+      if (isProcessingRef.current) {
+        steeringQueueRef.current.push(trimmed);
+        setEntries((prev) => [...prev, { role: "info", content: "◆ Queued (will process after current tool finishes)" }]);
+        return;
+      }
+
+      isProcessingRef.current = true;
+
+      // Update system prompt with current tool set (may have promoted tools)
+      messagesRef.current[0] = { role: "system", content: buildSystemPrompt() };
+
+      // ── PicoClaw-inspired: Tool TTL — tick down promoted tools ──
+      promotedToolsRef.current = promotedToolsRef.current
+        .map(t => ({ ...t, ttl: (t.ttl || 1) - 1 }))
+        .filter(t => (t.ttl || 0) > 0);
+
       // Agent loop: call LLM, check for tool calls, execute, feed back, repeat
       let loopCount = 0;
-      const MAX_LOOPS = 5;
+      const MAX_LOOPS = 8; // increased — parallel tool calls count as 1 loop
 
       while (loopCount < MAX_LOOPS) {
         loopCount++;
         setSpinnerMsg(loopCount === 1 ? "Thinking..." : "Processing tool results...");
 
+        // ── PicoClaw-inspired: Context Budget — trim before every LLM call ──
+        messagesRef.current = trimToContextBudget(messagesRef.current, CONTEXT_BUDGET);
+
         // Get non-streaming response to check for tool calls
         let response = "";
         try {
-          response = await client.chat(messagesRef.current, 500);
+          const chatResult = await client.chat(messagesRef.current, 500);
+          response = chatResult.text;
+          // Report stats from agent loop
+          onStatsUpdate({ tokPerSec: chatResult.tokPerSec, totalTokens: chatResult.totalTokens });
         } catch (e: any) {
           setSpinnerMsg("");
           setEntries((prev) => [...prev, { role: "error", content: `◆ Error: ${e.message}` }]);
@@ -652,30 +814,129 @@ print(chr(10).join(results))
 
         setSpinnerMsg("");
 
-        // Check for tool_call in response
-        const toolCallMatch = response.match(/<tool_call>([\s\S]*?)<\/tool_call>/);
+        // ── PicoClaw-inspired: Parallel Tool Execution ──
+        // Extract ALL tool_call tags (not just the first)
+        const toolCallMatches = [...response.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)];
 
-        if (!toolCallMatch) {
-          // No tool call — this is the final text response. Stream it for nice display.
+        if (toolCallMatches.length === 0) {
+          // No tool call — final text response
           messagesRef.current.push({ role: "assistant", content: response });
           setEntries((prev) => [...prev, { role: "assistant", content: response }]);
           break;
         }
 
-        // Parse and execute tool call
-        try {
-          const toolCall = JSON.parse(toolCallMatch[1]);
+        // Show what the model is doing
+        messagesRef.current.push({ role: "assistant", content: response });
+
+        // ── PicoClaw-inspired: Steering Queue check ──
+        // If user sent a message while we were processing, inject it
+        if (steeringQueueRef.current.length > 0) {
+          const queued = steeringQueueRef.current.shift()!;
+          setEntries((prev) => [...prev, { role: "info", content: `◆ Interrupting: processing queued message` }]);
+          messagesRef.current.push({ role: "user", content: queued });
+          continue; // skip remaining tool calls, process new message
+        }
+
+        // Parse all tool calls
+        const toolCalls: Array<{ name: string; arguments: any }> = [];
+        for (const match of toolCallMatches) {
+          try {
+            toolCalls.push(JSON.parse(match[1]));
+          } catch (e: any) {
+            setEntries((prev) => [...prev, { role: "error", content: `◆ Tool parse error: ${e.message}` }]);
+          }
+        }
+
+        if (toolCalls.length === 0) {
+          const cleanResponse = response.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+          if (cleanResponse) {
+            setEntries((prev) => [...prev, { role: "assistant", content: cleanResponse }]);
+          }
+          break;
+        }
+
+        // Execute tool calls — parallel when multiple, sequential when single
+        const executeTool = async (toolCall: { name: string; arguments: any }): Promise<string> => {
           const toolName = toolCall.name;
           const toolArgs = toolCall.arguments || {};
 
-          // Show what the model is doing
-          messagesRef.current.push({ role: "assistant", content: response });
+          // ── search_tools: PicoClaw Tool Discovery ──
+          if (toolName === "search_tools") {
+            const query = (toolArgs.query || "").toLowerCase();
+            const matches = HIDDEN_TOOLS.filter(t =>
+              t.name.includes(query) || t.description.toLowerCase().includes(query)
+            );
+            if (matches.length > 0) {
+              // Promote matched tools with TTL
+              for (const tool of matches) {
+                const existing = promotedToolsRef.current.find(t => t.name === tool.name);
+                if (existing) {
+                  existing.ttl = TOOL_PROMOTE_TTL;
+                } else {
+                  promotedToolsRef.current.push({ ...tool, hidden: false, ttl: TOOL_PROMOTE_TTL });
+                }
+              }
+              // Rebuild system prompt with newly promoted tools
+              messagesRef.current[0] = { role: "system", content: buildSystemPrompt() };
+              const found = matches.map(t => `${t.name}: ${t.description}`).join('\n');
+              setEntries((prev) => [...prev, { role: "info", content: `◆ Found ${matches.length} tools:\n${found}` }]);
+              return JSON.stringify({ tools_found: matches.map(t => t.name), message: "These tools are now available. Use them in your next response." });
+            }
+            return JSON.stringify({ tools_found: [], message: "No matching tools found. Use shell for general tasks." });
+          }
 
+          // ── write_file (hidden, promoted via search_tools) ──
+          if (toolName === "write_file") {
+            const filePath = (toolArgs.path || "").replace(/^~/, process.env.HOME || "");
+            try {
+              const { writeFileSync } = await import("node:fs");
+              writeFileSync(filePath, toolArgs.content || "");
+              setEntries((prev) => [...prev, { role: "info", content: `◆ Wrote: ${filePath}` }]);
+              return `File written successfully: ${filePath}`;
+            } catch (e: any) {
+              return `Error writing file: ${e.message}`;
+            }
+          }
+
+          // ── list_dir (hidden, promoted via search_tools) ──
+          if (toolName === "list_dir") {
+            const dirPath = (toolArgs.path || "~/").replace(/^~/, process.env.HOME || "");
+            try {
+              const output = execSync(`ls -la "${dirPath}" | head -30`, { encoding: "utf-8", timeout: 5000 }).trim();
+              setEntries((prev) => [...prev, { role: "info", content: `◆ Directory: ${dirPath}\n${output.split('\n').slice(0, 15).join('\n')}` }]);
+              return output;
+            } catch (e: any) {
+              return `Error: ${e.message?.split("\n")[0]}`;
+            }
+          }
+
+          // ── screenshot (hidden, promoted via search_tools) ──
+          if (toolName === "screenshot") {
+            try {
+              execSync("screencapture -x /tmp/tinybit-screenshot.png", { timeout: 5000 });
+              setEntries((prev) => [...prev, { role: "info", content: "◆ Screenshot saved to /tmp/tinybit-screenshot.png" }]);
+              return "Screenshot captured at /tmp/tinybit-screenshot.png";
+            } catch {
+              return "Screenshot failed";
+            }
+          }
+
+          // ── system_info (hidden, promoted via search_tools) ──
+          if (toolName === "system_info") {
+            try {
+              const info = execSync(`echo "OS: $(sw_vers -productName) $(sw_vers -productVersion)"; echo "Chip: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo Apple Silicon)"; echo "RAM: $(sysctl -n hw.memsize | awk '{print $1/1073741824}') GB"; echo "Disk: $(df -h / | tail -1 | awk '{print $4 " free of " $2}')"`, { encoding: "utf-8", timeout: 5000 }).trim();
+              setEntries((prev) => [...prev, { role: "info", content: `◆ System Info:\n${info}` }]);
+              return info;
+            } catch (e: any) {
+              return `Error: ${e.message?.split("\n")[0]}`;
+            }
+          }
+
+          // ── shell ──
           if (toolName === "shell") {
             const cmd = toolArgs.command;
             setSpinnerMsg(`Running: $ ${cmd}`);
             setEntries((prev) => [...prev, { role: "info", content: `◆ Running: $ ${cmd}` }]);
-
             let output = "";
             try {
               output = execSync(cmd, { encoding: "utf-8", timeout: 10000, maxBuffer: 1024 * 1024 }).trim();
@@ -685,18 +946,14 @@ print(chr(10).join(results))
             const truncOutput = output.split("\n").slice(0, 30).join("\n");
             setSpinnerMsg("");
             setEntries((prev) => [...prev, { role: "info", content: `◆ Output:\n${truncOutput}` }]);
+            return truncOutput;
+          }
 
-            // Feed result back to model
-            messagesRef.current.push({
-              role: "user",
-              content: `<tool_response>{"name": "shell", "output": ${JSON.stringify(truncOutput)}}</tool_response>`,
-            });
-
-          } else if (toolName === "web_search") {
+          // ── web_search ──
+          if (toolName === "web_search") {
             const query = toolArgs.query;
             setSpinnerMsg(`Searching: ${query}`);
             setEntries((prev) => [...prev, { role: "info", content: `◆ Searching: ${query}` }]);
-
             let results = "";
             try {
               const safeQuery = query.replace(/[`$\\'"]/g, "");
@@ -708,63 +965,87 @@ from ddgs import DDGS
 from datetime import datetime
 q = sys.argv[1]
 is_news = sys.argv[2] == '1'
-res = []
+seen = set()
+out = []
+
+def add(title, body, date='', src='', url=''):
+    key = title.strip().lower()[:60]
+    if key in seen: return
+    seen.add(key)
+    line = ''
+    if date: line += '[' + date[:10] + '] '
+    line += title.strip()
+    if src: line += ' (' + src + ')'
+    line += ': ' + body.strip()
+    out.append(line)
+
 with DDGS() as d:
     if is_news:
-        for r in d.news(q, max_results=5):
-            res.append(r.get('date','')[:10] + ' - ' + r.get('title','') + ': ' + r.get('body',''))
+        try:
+            for r in d.news(q, max_results=8):
+                add(r.get('title',''), r.get('body',''), r.get('date',''), r.get('source',''), r.get('url',''))
+        except: pass
+        try:
+            for r in d.text(q + ' ' + datetime.now().strftime('%Y-%m-%d'), max_results=5):
+                add(r.get('title',''), r.get('body',''), url=r.get('href',''))
+        except: pass
     else:
-        for r in d.text(q + ' ' + datetime.now().strftime('%B %Y'), max_results=5):
-            res.append(r.get('title','') + ': ' + r.get('body',''))
-print(chr(10).join(res))
+        try:
+            for r in d.text(q + ' ' + datetime.now().strftime('%B %Y'), max_results=8):
+                add(r.get('title',''), r.get('body',''), url=r.get('href',''))
+        except: pass
+        if len(out) < 4:
+            try:
+                for r in d.news(q, max_results=5):
+                    add(r.get('title',''), r.get('body',''), r.get('date',''), r.get('source',''))
+            except: pass
+
+for line in out[:10]:
+    print('- ' + line)
 " "${safeQuery}" "${isNews ? '1' : '0'}"`,
-                { encoding: "utf-8", timeout: 15000 }
+                { encoding: "utf-8", timeout: 20000 }
               ).trim();
             } catch {
-              results = "Search failed";
+              results = "Search failed — try different keywords";
             }
             setSpinnerMsg("");
-            setEntries((prev) => [...prev, { role: "info", content: `◆ Results:\n${results.split('\n').map(l => '  ' + l.slice(0, 100)).join('\n')}` }]);
+            const trimmed = results.split('\n').slice(0, 6).map((l: string) => l.slice(0, 200)).join('\n');
+            setEntries((prev) => [...prev, { role: "info", content: `◆ Results:\n${trimmed.split('\n').map((l: string) => '  ' + l.slice(0, 120)).join('\n')}` }]);
+            return trimmed;
+          }
 
-            messagesRef.current.push({
-              role: "user",
-              content: `<tool_response>{"name": "web_search", "output": ${JSON.stringify(results)}}</tool_response>`,
-            });
-
-          } else if (toolName === "read_file") {
-            let filePath = toolArgs.path.replace(/^~/, process.env.HOME || "");
-            // Auto-resolve relative paths — check common locations
+          // ── read_file ──
+          if (toolName === "read_file") {
+            let filePath = (toolArgs.path || "").replace(/^~/, process.env.HOME || "");
             if (!filePath.startsWith("/")) {
               const home = process.env.HOME || "";
-              const candidates = [
-                `${home}/Desktop/${filePath}`,
-                `${home}/Downloads/${filePath}`,
-                `${home}/Documents/${filePath}`,
-                `${home}/${filePath}`,
-                filePath,
-              ];
-              for (const c of candidates) {
-                try { execSync(`test -f "${c}"`, { timeout: 1000 }); filePath = c; break; } catch {}
+              for (const dir of ["Desktop", "Downloads", "Documents", ""]) {
+                const candidate = dir ? `${home}/${dir}/${filePath}` : `${home}/${filePath}`;
+                try { execSync(`test -f "${candidate}"`, { timeout: 1000 }); filePath = candidate; break; } catch {}
               }
             }
             const isDocument = /\.(pdf|docx|xlsx|pptx|doc|png|jpg|jpeg|tiff|bmp|heic)$/i.test(filePath);
-
-            setSpinnerMsg(isDocument ? `LiteParse: ${filePath}` : `Reading: ${filePath}`);
+            setSpinnerMsg(isDocument ? `Parsing: ${filePath}` : `Reading: ${filePath}`);
             setEntries((prev) => [...prev, { role: "info", content: `◆ ${isDocument ? "Parsing" : "Reading"}: ${filePath}` }]);
-
             let content = "";
             try {
               if (isDocument) {
-                // Use LiteParse — copy to temp to handle spaces in paths
-                const ext = filePath.split(".").pop() || "pdf";
-                execSync(`cp "${filePath}" "/tmp/tinybit_parse.${ext}"`, { timeout: 5000 });
-                content = execSync(`npx lit parse "/tmp/tinybit_parse.${ext}" --dpi 72 --num-workers 1 -q 2>/dev/null | head -200`, {
-                  encoding: "utf-8",
-                  timeout: 30000,
-                }).trim();
-                if (!content || content.length < 10) {
-                  content = "LiteParse returned no content. File may be empty or unsupported.";
+                const ext = (filePath.split(".").pop() || "").toLowerCase();
+                if (ext === "docx") {
+                  content = execSync(`/opt/homebrew/bin/python3.13 -c "
+from docx import Document
+doc = Document('${filePath.replace(/'/g, "\\'")}')
+for p in doc.paragraphs:
+    if p.text.strip(): print(p.text)
+for t in doc.tables:
+    for row in t.rows:
+        print(' | '.join(c.text for c in row.cells))
+" 2>&1 | head -200`, { encoding: "utf-8", timeout: 15000 }).trim();
+                } else {
+                  execSync(`cp "${filePath}" "/tmp/tinybit_parse.${ext}"`, { timeout: 5000 });
+                  content = execSync(`cd /Users/nicozahniser/mac-code-ui && npx lit parse "/tmp/tinybit_parse.${ext}" --dpi 72 --num-workers 1 -q 2>/dev/null | head -200`, { encoding: "utf-8", timeout: 30000 }).trim();
                 }
+                if (!content || content.length < 10) content = "Document returned no content.";
               } else {
                 content = execSync(`head -80 "${filePath}"`, { encoding: "utf-8", timeout: 5000 }).trim();
               }
@@ -772,24 +1053,56 @@ print(chr(10).join(res))
               content = `Error: ${err.message?.split("\n")[0]}`;
             }
             setSpinnerMsg("");
-
-            messagesRef.current.push({
-              role: "user",
-              content: `<tool_response>{"name": "read_file", "output": ${JSON.stringify(content)}}</tool_response>`,
-            });
-
-          } else {
-            // Unknown tool
-            setEntries((prev) => [...prev, { role: "error", content: `◆ Unknown tool: ${toolName}` }]);
-            break;
+            return content;
           }
+
+          return `Unknown tool: ${toolName}. Use search_tools to find available tools.`;
+        };
+
+        // ── Execute tools — parallel when multiple ──
+        try {
+          const toolResults: string[] = [];
+          if (toolCalls.length === 1) {
+            // Single tool — execute directly
+            toolResults.push(await executeTool(toolCalls[0]));
+          } else {
+            // Multiple tools — execute in parallel (PicoClaw pattern)
+            setEntries((prev) => [...prev, { role: "info", content: `◆ Running ${toolCalls.length} tools in parallel...` }]);
+            const results = await Promise.all(toolCalls.map(tc => {
+              // Wrap each in try/catch so one failure doesn't kill the batch (PicoClaw panic recovery)
+              return executeTool(tc).catch(e => `Error: ${e.message}`);
+            }));
+            toolResults.push(...results);
+          }
+
+          // Feed all results back as one message
+          const combinedResults = toolCalls.map((tc, i) =>
+            `<tool_response>{"name": "${tc.name}", "output": ${JSON.stringify(toolResults[i] || "No output")}}</tool_response>`
+          ).join('\n');
+          messagesRef.current.push({ role: "user", content: combinedResults });
+
         } catch (e: any) {
-          setEntries((prev) => [...prev, { role: "error", content: `◆ Tool parse error: ${e.message}` }]);
-          // Still show the raw response
-          messagesRef.current.push({ role: "assistant", content: response });
-          setEntries((prev) => [...prev, { role: "assistant", content: response.replace(/<tool_call>[\s\S]*?<\/tool_call>/, '').trim() }]);
+          setEntries((prev) => [...prev, { role: "error", content: `◆ Tool error: ${e.message}` }]);
+          const cleanResponse = response.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+          if (cleanResponse) {
+            setEntries((prev) => [...prev, { role: "assistant", content: cleanResponse }]);
+          }
           break;
         }
+      }
+
+      if (loopCount >= MAX_LOOPS) {
+        setEntries((prev) => [...prev, { role: "info", content: "◆ Reached max tool iterations." }]);
+      }
+
+      isProcessingRef.current = false;
+
+      // ── PicoClaw-inspired: Drain steering queue ──
+      if (steeringQueueRef.current.length > 0) {
+        const next = steeringQueueRef.current.shift()!;
+        // Process next queued message
+        handleSubmit(next);
+        return;
       }
 
       onStatusChange("connected");

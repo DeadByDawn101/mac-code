@@ -1,6 +1,6 @@
-# Tiny Bit Terminal — Compare Tiny AI Models
+# Tiny Bit Terminal
 
-A retro CRT-style terminal for comparing tiny AI models locally on your Mac. No cloud, no API keys. Start with a 1-bit 8B model (1.16 GB) and a 2-bit 9B model (3.19 GB) — both fit on any Mac.
+A local AI agent that runs entirely on your Mac. No cloud, no API keys. Tool calling, web search, document parsing, and multi-model compare — all from a retro terminal UI.
 
 ```
           ______________
@@ -9,7 +9,7 @@ A retro CRT-style terminal for comparing tiny AI models locally on your Mac. No 
        /____________ /  |
       | ___________ |   |
       ||           ||   |
-      ||  mac-code ||   |
+      ||  tiny bit ||   |
       ||           ||   |
       ||___________||   |
       |   _______   |  /
@@ -23,122 +23,96 @@ A retro CRT-style terminal for comparing tiny AI models locally on your Mac. No 
  `-----------------------'
 ```
 
-## Quick Start
-
-### Option A: Bonsai-8B (1-bit, 1.16 GB — runs on ANY Mac)
-
-The fastest option. A 1-bit 8B model that fits in ~1 GB of RAM.
+## Install
 
 ```bash
-# 1. Install Prism's llama.cpp fork (supports 1-bit models)
-git clone --depth 1 https://github.com/PrismML-Eng/llama.cpp.git
-cd llama.cpp
-cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc) --target llama-server
+# 1. Clone
+git clone https://github.com/walter-grace/mac-code.git
+cd mac-code/research/tiny-bit-terminal
+npm install
 
-# 2. Download the model (1.16 GB)
-pip install huggingface-hub
+# 2. Install python search (one time)
+pip3 install duckduckgo-search
+
+# 3. Build llama.cpp and start a model server (pick one):
+
+# Option A: Bonsai-8B (1-bit, 1.16 GB — runs on ANY Mac)
+git clone --depth 1 https://github.com/PrismML-Eng/llama.cpp.git ~/llama.cpp
+cd ~/llama.cpp && cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu) --target llama-server
 huggingface-cli download prism-ml/Bonsai-8B-gguf Bonsai-8B.gguf --local-dir ./models
+./build/bin/llama-server -m ./models/Bonsai-8B.gguf -ngl 999 -c 2048 --port 8203
 
-# 3. Start the server
-./build/bin/llama-server -m ./models/Bonsai-8B.gguf -ngl 999 -c 2048 --port 8203 --host 127.0.0.1
-
-# 4. Run mac-code (in another terminal)
-cd mac-code-ui
-npm install
-npx tsx src/index.tsx --server http://localhost:8203
-```
-
-**Speed:** ~9-20 tok/s on M2, ~50-130 tok/s on M4 Pro
-
-### Option B: Qwen3.5-9B (IQ2_XXS, 3.19 GB — 64K context)
-
-Smarter model with long context. Needs 8+ GB RAM.
-
-```bash
-# 1. Build stock llama.cpp
-git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
-cd llama.cpp
-cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc) --target llama-server
-
-# 2. Download the model (3.19 GB)
+# Option B: Qwen3.5-9B (2-bit, 3.19 GB — smarter, needs 8+ GB RAM)
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git ~/llama.cpp
+cd ~/llama.cpp && cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu) --target llama-server
 huggingface-cli download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-UD-IQ2_XXS.gguf --local-dir ./models
+./build/bin/llama-server -m ./models/Qwen3.5-9B-UD-IQ2_XXS.gguf -ngl 999 -c 4096 --port 8204
 
-# 3. Start the server
-./build/bin/llama-server -m ./models/Qwen3.5-9B-UD-IQ2_XXS.gguf -ngl 999 -c 4096 --port 8204 --host 127.0.0.1 --reasoning off
-
-# 4. Run mac-code
-cd mac-code-ui
-npm install
-npx tsx src/index.tsx --server http://localhost:8204
-```
-
-**Speed:** ~1-5 tok/s on 8 GB, ~10-20 tok/s on 16+ GB
-
-### Option C: Both models + compare mode
-
-Run both servers, then:
-```bash
+# 4. Run tiny bit (in another terminal)
+cd mac-code/research/tiny-bit-terminal
 npx tsx src/index.tsx --server http://localhost:8203
 ```
 
-Use `/compare <prompt>` to race both models side-by-side.
+## What It Does
 
-## Features
+Just type naturally. The model calls tools automatically:
+
+```
+▶ you: what's on my desktop?
+◆ Running: $ ls ~/Desktop
+◆ Output: photo.png  notes.txt  project/
+tiny bit: Your desktop has a photo, a text file, and a project folder.
+
+▶ you: search for today's AI news
+◆ Searching: AI LLM news March 2026
+◆ Results: [2026-03-31] OpenAI drops Sora...
+tiny bit: Here are today's highlights...
+```
+
+## Commands
 
 | Command | What it does |
 |---------|-------------|
-| (just type) | Chat — model auto-uses tools when needed |
-| `/search <query>` | Web search via DuckDuckGo + AI synthesis |
-| `/shell <task>` | Run shell commands (or ask naturally) |
-| `/image <path>` | Describe an image |
-| `/screenshot` | Capture + analyze your screen |
-| `/compare <prompt>` | Race Bonsai vs Qwen3.5-9B side-by-side |
-| `/stats` | Server stats |
-| `/clear` | Clear chat |
-| `/help` | Show commands |
+| (just type) | Chat with tool calling |
+| `/search <query>` | Web search + AI summary |
+| `/shell <task>` | Run shell commands (or describe what you want) |
+| `/document <path>` | Parse PDF, DOCX, images |
+| `/compare` | Race two models side-by-side |
+| `/models` | List available models + download commands |
+| `/stats` | Server performance stats |
+| `/clear` | Clear chat history |
+| `/help` | Show all commands |
 | `/quit` | Exit |
 
-## Tool Calling
+## Architecture (PicoClaw-inspired)
 
-The model automatically uses tools when needed. Just ask naturally:
+The agent uses patterns from [PicoClaw](https://github.com/sipeed/picoclaw):
 
-```
-> what's on my desktop?
-◆ Running: $ ls ~/Desktop
-◆ Output:
-  photo.png
-  notes.txt
-  project/
-
-Your desktop has a photo, a text file, and a project folder.
-
-> read notes.txt
-◆ Reading: ~/Desktop/notes.txt
-◆ Contents: ...
-```
-
-No slash commands needed — the model decides when to search the web, run commands, or read files.
+- **Context Budget** — auto-trims conversation history before each LLM call (2.5 chars/token heuristic). Never overflows the context window.
+- **Tool Discovery** — core tools always visible, hidden tools (write_file, list_dir, screenshot, system_info) discoverable via `search_tools` meta-tool with auto-demotion TTL.
+- **Deterministic Tool Order** — tools sorted alphabetically for better KV cache hits in llama.cpp.
+- **Steering Queue** — user messages during tool execution are queued and injected at the next safe point.
+- **Parallel Tool Execution** — multiple tool calls in one response run concurrently with per-tool error recovery.
 
 ## Models
 
-| Model | Size | Speed (est.) | Best For |
-|-------|------|-------------|----------|
-| **Qwen3-0.6B** | 0.4 GB | 50+ tok/s | Ultra-fast, testing |
-| **Bonsai-8B (1-bit)** | 1.16 GB | 9-20 tok/s | Fast chat, tool calling |
-| **Qwen3-1.7B** | 1.1 GB | 30+ tok/s | Lightweight assistant |
-| **Ministral-3B** | 2.15 GB | 15-25 tok/s | Balanced quality/speed |
-| **Qwen3-4B** | 2.5 GB | 15-25 tok/s | Good quality, small |
-| **Qwen3.5-9B (IQ2)** | 3.19 GB | 1-5 tok/s | Smart, 64K context |
-| **Qwen3-8B** | 5.0 GB | 5-15 tok/s | Best quality under 8B |
+| Model | Size | Speed (M2 Air) | Notes |
+|-------|------|----------------|-------|
+| Bonsai-8B (1-bit) | 1.16 GB | 9-20 tok/s | Needs [PrismML fork](https://github.com/PrismML-Eng/llama.cpp) |
+| Qwen3-0.6B | 0.4 GB | 50+ tok/s | Ultra-fast, basic |
+| Qwen3-1.7B | 1.1 GB | 30+ tok/s | Lightweight |
+| Ministral-3B | 2.15 GB | 15-25 tok/s | Balanced |
+| Qwen3-4B | 2.5 GB | 15-25 tok/s | Good quality |
+| Qwen3.5-9B (IQ2) | 3.19 GB | 1-5 tok/s | Smart, 64K context |
 
-Use `/models` in the terminal to see download commands and check which are running.
-Use `/compare` to race any two models side-by-side.
+Run `/models` in the terminal to check which are online and get download commands.
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Node.js 18+ or Bun
+- macOS with Apple Silicon (M1+)
+- Node.js 18+
+- Python 3 with `duckduckgo-search` (for web search)
 - llama.cpp (built from source)
-- 8 GB RAM minimum (Bonsai runs on 4 GB)
+- 4 GB RAM minimum (Bonsai), 8 GB for larger models
