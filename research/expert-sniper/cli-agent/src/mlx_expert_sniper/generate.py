@@ -20,7 +20,11 @@ def load_engine(model_dir):
         bias = 0.0
 
     model_type = _detect_model_type(model_dir)
-    if "qwen3_next" in model_type:
+    if "gemma4" in model_type:
+        from . import engine_gemma4 as engine_mod
+        engine_mod.MODEL_DIR = model_dir
+        from .engine_gemma4 import MoESniperEngineGemma4 as EngineClass
+    elif "qwen3_next" in model_type:
         from . import engine_next as engine_mod
         engine_mod.MODEL_DIR = model_dir
         from .engine_next import MoESniperEngineNext as EngineClass
@@ -39,11 +43,16 @@ def load_engine(model_dir):
 
 
 def generate_stream(engine, messages, bias=0.0, max_tokens=200):
-    """Generator yielding token strings. Handles both 35B (SSM) and 30B (standard attention)."""
+    """Generator yielding token strings. Handles Qwen + Gemma 4 architectures."""
     import mlx.core as mx
     from mlx_lm.models.base import create_attention_mask
-    from .engine import run_expert_ffn
 
+    # Detect model type — Gemma 4 uses its own forward pass
+    is_gemma4 = hasattr(engine, 'per_expert_scales')  # Gemma 4 engine has this
+    if is_gemma4:
+        return _generate_stream_gemma4(engine, messages, max_tokens)
+
+    from .engine import run_expert_ffn
     has_ssm = hasattr(engine.model.model, 'fa_idx')
     num_experts = 256 if has_ssm else 128
 
@@ -149,4 +158,44 @@ def generate_stream(engine, messages, bias=0.0, max_tokens=200):
             break
         yield chunk
         logits = forward(token.reshape(1, 1))
+        mx.eval(logits)
+
+
+def _generate_stream_gemma4(engine, messages, max_tokens=200):
+    """Generator for Gemma 4 — uses engine's own forward pass."""
+    import mlx.core as mx
+
+    engine.reset_cache()
+    tok = engine.tokenizer
+    try:
+        text = tok.apply_chat_template(messages, tokenize=False,
+                                        add_generation_prompt=True)
+    except Exception:
+        text = messages[-1]["content"]
+    tokens = tok.encode(text)
+    input_ids = mx.array([tokens])
+
+    logits = engine.forward(input_ids)
+    mx.eval(logits)
+
+    # Gemma 4 EOS tokens
+    eos_ids = set()
+    if hasattr(tok, 'eos_token_id'):
+        if isinstance(tok.eos_token_id, list):
+            eos_ids.update(tok.eos_token_id)
+        elif tok.eos_token_id is not None:
+            eos_ids.add(tok.eos_token_id)
+    eos_ids.update({1, 106, 212})  # Gemma 4 EOS tokens
+
+    for _ in range(max_tokens):
+        token = mx.argmax(logits[:, -1, :], axis=-1)
+        mx.eval(token)
+        tid = token.item()
+        if tid in eos_ids:
+            break
+        chunk = tok.decode([tid])
+        if any(st in chunk for st in STOP_TOKENS):
+            break
+        yield chunk
+        logits = engine.forward(token.reshape(1, 1))
         mx.eval(logits)

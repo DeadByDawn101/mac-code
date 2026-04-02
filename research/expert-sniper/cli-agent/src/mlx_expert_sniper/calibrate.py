@@ -63,7 +63,11 @@ def _detect_model_type(model_dir):
 def _build_engine(model_dir, cache_size):
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     model_type = _detect_model_type(model_dir)
-    if "qwen3_next" in model_type:
+    if "gemma4" in model_type:
+        from .engine_gemma4 import MoESniperEngineGemma4 as EngineClass
+        from . import engine_gemma4 as engine_mod
+        engine_mod.MODEL_DIR = model_dir
+    elif "qwen3_next" in model_type:
         from .engine_next import MoESniperEngineNext as EngineClass
         from . import engine_next as engine_mod
         engine_mod.MODEL_DIR = model_dir
