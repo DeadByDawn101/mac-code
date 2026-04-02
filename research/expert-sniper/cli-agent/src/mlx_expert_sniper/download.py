@@ -17,6 +17,11 @@ MODEL_REGISTRY = {
         "default_dir": "qwen35-35b-stream",
         "description": "Qwen3.5-35B-A3B 4-bit (19.5 GB, 256 experts, 5.4 tok/s on M4 16GB)",
     },
+    "qwen3-30b": {
+        "repo": "mlx-community/Qwen3-30B-A3B-4bit",
+        "default_dir": "qwen3-30b-stream",
+        "description": "Qwen3-30B-A3B 4-bit (17.2 GB, 128 experts, 3.3 tok/s on M4 16GB)",
+    },
 }
 
 TENSOR_ORDER = [

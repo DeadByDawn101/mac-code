@@ -55,10 +55,23 @@ def auto_size_cache(model_dir, ram_gb=None):
     return max_cache, expert_block_bytes, pinned_bytes
 
 
+def _detect_model_type(model_dir):
+    config = json.load(open(os.path.join(model_dir, "config.json")))
+    return config.get("model_type", "qwen3_5_moe")
+
+
 def _build_engine(model_dir, cache_size):
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    from .engine import MoESniperEngine35B
-    engine = MoESniperEngine35B(cache_size=cache_size, enable_prediction=False)
+    model_type = _detect_model_type(model_dir)
+    if "qwen3_5" in model_type:
+        from .engine import MoESniperEngine35B as EngineClass
+        from . import engine as engine_mod
+        engine_mod.MODEL_DIR = model_dir
+    else:
+        from .engine_30b import MoESniperEngine30B as EngineClass
+        from . import engine_30b as engine_mod
+        engine_mod.MODEL_DIR = model_dir
+    engine = EngineClass(cache_size=cache_size, enable_prediction=False)
     engine.load()
     return engine
 
@@ -79,18 +92,28 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
     prev_layer_experts = {}
     total_tokens = 0
 
+    has_ssm = hasattr(engine.model.model, 'fa_idx')
+
     def instrumented_forward(input_ids):
         nonlocal prev_layer_experts
-        from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+        from mlx_lm.models.base import create_attention_mask
         h = engine.model.model.embed_tokens(input_ids)
-        fa_mask = create_attention_mask(h, engine.cache[engine.model.model.fa_idx])
-        ssm_mask = create_ssm_mask(h, engine.cache[engine.model.model.ssm_idx])
+        if has_ssm:
+            from mlx_lm.models.base import create_ssm_mask
+            fa_mask = create_attention_mask(h, engine.cache[engine.model.model.fa_idx])
+            ssm_mask = create_ssm_mask(h, engine.cache[engine.model.model.ssm_idx])
+        else:
+            fa_mask = create_attention_mask(h, engine.cache[0])
+            ssm_mask = None
         prev_layer_experts = {}
         for i in range(num_layers):
             layer = engine.model.model.layers[i]
-            mask = ssm_mask if layer.is_linear else fa_mask
+            if has_ssm:
+                mask = ssm_mask if layer.is_linear else fa_mask
+            else:
+                mask = fa_mask
             normed = layer.input_layernorm(h)
-            if layer.is_linear:
+            if has_ssm and layer.is_linear:
                 attn_out = layer.linear_attn(normed, mask=mask, cache=engine.cache[i])
             else:
                 attn_out = layer.self_attn(normed, mask=mask, cache=engine.cache[i])
@@ -106,7 +129,7 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
                 scores = scores / scores.sum(axis=-1, keepdims=True)
             mx.eval(inds, scores)
             active_ids = [int(e) for e in np.array(inds).flatten()]
-            gate_weights = [float(s) for s in np.array(scores).flatten()]
+            gate_weights = [float(s) for s in np.array(scores.astype(mx.float32)).flatten()]
             active_set = list(set(active_ids))
             for eid, gw in zip(active_ids, gate_weights):
                 count[i, eid] += 1
@@ -120,11 +143,12 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
                 engine.reader.prefetch_experts(i + 1, active_set)
             expert_data = engine.reader.get_experts(i, active_set)
             expert_out = run_expert_ffn(normed, expert_data, inds, scores)
-            shared_out = layer.mlp.shared_expert(normed)
-            shared_gate = mx.sigmoid(layer.mlp.shared_expert_gate(normed))
-            if shared_gate.ndim < shared_out.ndim:
-                shared_gate = shared_gate[..., None]
-            expert_out = expert_out + shared_gate * shared_out
+            if hasattr(layer.mlp, 'shared_expert'):
+                shared_out = layer.mlp.shared_expert(normed)
+                shared_gate = mx.sigmoid(layer.mlp.shared_expert_gate(normed))
+                if shared_gate.ndim < shared_out.ndim:
+                    shared_gate = shared_gate[..., None]
+                expert_out = expert_out + shared_gate * shared_out
             h = h + expert_out
             mx.eval(h)
             del expert_data, expert_out, normed, attn_out
@@ -171,8 +195,12 @@ def run_shared_calibration_pass(engine, prompts, tokens_per_prompt=20):
 def _generate_with_bias(engine, prompt, bias, max_tokens=40):
     """Generate with routing bias on raw logits. No REAP masking."""
     import mlx.core as mx
-    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    from mlx_lm.models.base import create_attention_mask
+    # Import run_expert_ffn from whichever engine module loaded this engine
     from .engine import run_expert_ffn
+
+    has_ssm = hasattr(engine.model.model, 'fa_idx')
+    num_experts_total = 256 if has_ssm else 128  # 35B vs 30B
 
     engine.reset_cache()
     tok = engine.tokenizer
@@ -187,13 +215,21 @@ def _generate_with_bias(engine, prompt, bias, max_tokens=40):
 
     def biased_forward(input_ids):
         h = engine.model.model.embed_tokens(input_ids)
-        fa_mask = create_attention_mask(h, engine.cache[engine.model.model.fa_idx])
-        ssm_mask = create_ssm_mask(h, engine.cache[engine.model.model.ssm_idx])
+        if has_ssm:
+            from mlx_lm.models.base import create_ssm_mask
+            fa_mask = create_attention_mask(h, engine.cache[engine.model.model.fa_idx])
+            ssm_mask = create_ssm_mask(h, engine.cache[engine.model.model.ssm_idx])
+        else:
+            fa_mask = create_attention_mask(h, engine.cache[0])
+            ssm_mask = None
         for i in range(engine.num_layers):
             layer = engine.model.model.layers[i]
-            mask = ssm_mask if layer.is_linear else fa_mask
+            if has_ssm:
+                mask = ssm_mask if layer.is_linear else fa_mask
+            else:
+                mask = fa_mask
             normed = layer.input_layernorm(h)
-            if layer.is_linear:
+            if has_ssm and layer.is_linear:
                 attn_out = layer.linear_attn(normed, mask=mask, cache=engine.cache[i])
             else:
                 attn_out = layer.self_attn(normed, mask=mask, cache=engine.cache[i])
@@ -202,8 +238,8 @@ def _generate_with_bias(engine, prompt, bias, max_tokens=40):
             normed = layer.post_attention_layernorm(h)
             raw_logits = layer.mlp.gate(normed)
             if bias > 0 and engine.reader.lru is not None:
-                cached_mask = np.zeros(256, dtype=np.float32)
-                for eid in range(256):
+                cached_mask = np.zeros(num_experts_total, dtype=np.float32)
+                for eid in range(num_experts_total):
                     if engine.reader.lru.get(i, eid) is not None:
                         cached_mask[eid] = bias
                 raw_logits = raw_logits + mx.array(cached_mask).reshape(1, -1)
@@ -227,11 +263,12 @@ def _generate_with_bias(engine, prompt, bias, max_tokens=40):
                 engine.reader.prefetch_experts(i+1, active_ids)
             expert_data = engine.reader.get_experts(i, active_ids)
             expert_out = run_expert_ffn(normed, expert_data, inds, scores)
-            shared_out = layer.mlp.shared_expert(normed)
-            shared_gate = mx.sigmoid(layer.mlp.shared_expert_gate(normed))
-            if shared_gate.ndim < shared_out.ndim:
-                shared_gate = shared_gate[..., None]
-            expert_out = expert_out + shared_gate * shared_out
+            if hasattr(layer.mlp, 'shared_expert'):
+                shared_out = layer.mlp.shared_expert(normed)
+                shared_gate = mx.sigmoid(layer.mlp.shared_expert_gate(normed))
+                if shared_gate.ndim < shared_out.ndim:
+                    shared_gate = shared_gate[..., None]
+                expert_out = expert_out + shared_gate * shared_out
             h = h + expert_out
             mx.eval(h)
             del expert_data, expert_out, normed, attn_out
@@ -258,13 +295,12 @@ def sweep_routing_bias(model_dir, cache_size, reap_mask, coact_matrix,
                        bias_values=BIAS_VALUES):
     """Find highest bias where quality checks pass. No REAP during sweep."""
     import mlx.core as mx, gc
-    from .engine import MoESniperEngine35B
 
     best_bias = 0.0
     for bias in bias_values:
         print(f"  Testing bias={bias}...", end=" ", flush=True)
-        engine = MoESniperEngine35B(cache_size=cache_size, enable_prediction=True)
-        engine.load()
+        engine = _build_engine(model_dir, cache_size)
+        engine._enable_prediction = True
 
         all_pass = True
         for prompt, expected in QUALITY_CHECKS:
