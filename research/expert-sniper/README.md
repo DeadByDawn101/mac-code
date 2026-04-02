@@ -145,7 +145,7 @@ Google's Gemma 4-26B-A4B has 128 experts with top-8 routing (4B active of 26B to
 | M2 MacBook Air | IQ2_M | 9.3 GB | 8 GB | **1.37 tok/s** | No — MoE sparsity keeps working set small |
 | M4 Mac Mini | IQ2_M | 9.3 GB | 16 GB | **36.5 tok/s** | No — fits in RAM |
 | M4 Mac Mini | Q4_K_M | 16.9 GB | 16 GB | **5.18 tok/s** | No — MoE sparsity handles it |
-| M4 Mac Mini | Q8_0 | ~27 GB | 16 GB | *testing* | *pending* |
+| M4 Mac Mini | Q8_0 | 26.9 GB | 16 GB | **0 tok/s (thrash)** | CPU_REPACK doubles memory to 51 GB, can't finish loading |
 
 **Key finding:** Gemma 4's MoE sparsity ratio (4B/26B = 15.4% activation) is low enough that the OS page cache handles memory pressure without explicit madvise prefetch. This contrasts with Qwen3.5-35B-A3B where stock llama.cpp thrashes to 0 tok/s at 10.6 GB on 8 GB RAM — Qwen's higher effective activation ratio (shared experts + larger attention) overwhelms the page cache.
 
