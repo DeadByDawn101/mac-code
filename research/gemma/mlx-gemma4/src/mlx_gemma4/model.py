@@ -114,6 +114,9 @@ class Attention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.is_sliding = args.layer_types[layer_idx] == "sliding_attention"
+        self.is_kv_shared = False  # set by Gemma4TextModel after init
+        self.store_kv_for_sharing = False  # set by Gemma4TextModel after init
+        self._shared_kv = None  # storage for shared KV activations
         # K=V sharing only applies to full (non-sliding) attention layers
         self.use_kv_sharing = args.attention_k_eq_v and not self.is_sliding
 
@@ -151,22 +154,29 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        shared_kv_store: Optional[dict] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
         queries = self.q_proj(x)
-        keys = self.k_proj(x)
-        # K=V sharing: only for full attention layers
-        values = keys if self.use_kv_sharing else self.v_proj(x)
+
+        if self.is_kv_shared and shared_kv_store and self.layer_idx in shared_kv_store:
+            # Reuse KV activations from the base layer's cache
+            keys, values = shared_kv_store[self.layer_idx]
+        else:
+            keys = self.k_proj(x)
+            values = keys if self.use_kv_sharing else self.v_proj(x)
+            keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+            keys = self.k_norm(keys)
+            values = self.v_norm(values)
+
+            # Store KV for shared layers to reuse
+            if self.store_kv_for_sharing and shared_kv_store is not None:
+                shared_kv_store[self.layer_idx] = (keys, values)
 
         queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-        # Norms: q_norm and k_norm BEFORE RoPE, v_norm on values
         queries = self.q_norm(queries)
-        keys = self.k_norm(keys)
-        values = self.v_norm(values)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -479,13 +489,17 @@ class Gemma4TextModel(nn.Module):
         ]
         self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-        # KV sharing: last N layers share k_proj/k_norm with base layer
-        num_shared = getattr(args, "num_kv_shared_layers", 0) or 0
-        if num_shared > 0:
-            base = args.num_hidden_layers - num_shared - 1
-            for i in range(base + 1, args.num_hidden_layers):
-                self.layers[i].self_attn.k_proj = self.layers[base].self_attn.k_proj
-                self.layers[i].self_attn.k_norm = self.layers[base].self_attn.k_norm
+        # KV sharing: last N layers reuse KV ACTIVATIONS from a base layer's cache
+        # (NOT weight sharing — each layer keeps its own k_proj/v_proj weights)
+        self.num_kv_shared = getattr(args, "num_kv_shared_layers", 0) or 0
+        if self.num_kv_shared > 0:
+            self.first_shared = args.num_hidden_layers - self.num_kv_shared
+            # Mark shared layers
+            for i in range(self.first_shared, args.num_hidden_layers):
+                self.layers[i].self_attn.is_kv_shared = True
+            # The base layer stores its KV for shared layers to reuse
+            base = self.first_shared - 1
+            self.layers[base].self_attn.store_kv_for_sharing = True
 
         # PLE embedding (separate from main embedding, no sqrt scaling)
         self.has_ple = (args.hidden_size_per_layer_input or 0) > 0
